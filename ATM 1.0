@@ -1,8 +1,28 @@
 # Copyright © 2026 Anas Boutaghroucht
 # Licensed under the MIT License.
 # See LICENSE file in the project root for full license information.
+
 import random
 import time
+import json
+import os
+
+DATA_FILE = "users.json"
+
+def charger_donnees():
+    if not os.path.exists(DATA_FILE):
+        # Création d'un fichier par défaut si inexistant
+        initial_data = {
+            "1981": {"solde": 1000000, "nom": "Dupont", "prenom": "Jean", "email": "jean.dupont@email.com"}
+        }
+        sauvegarder_donnees(initial_data)
+        return initial_data
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def sauvegarder_donnees(users):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f, indent=4, ensure_ascii=False)
 
 def generer_pin(users):
     while True:
@@ -13,30 +33,27 @@ def generer_pin(users):
 def envoyer_message(email, sujet, message):
     with open("messages.txt", "a", encoding="utf-8") as f:
         f.write(f"Pour: {email}\nSujet: {sujet}\nMessage: {message}\n---\n")
-def atm():
-    # users : pin -> {"solde": float, "nom": str, "prenom": str, "email": str}
-    users = {
-        "1981": {"solde": 1000000000, "nom": "Dupont", "prenom": "Jean", "email": "jean.dupont@email.com"},
-        "6789": {"solde": 500000000, "nom": "Martin", "prenom": "Alice", "email": "alice.martin@email.com"},
-        "5432": {"solde": 20000, "nom": "Doe", "prenom": "John", "email": "john.doe@email.com"}
-    }
 
+def atm():
+    users = charger_donnees()
+    
     while True:
         pin = input("Entrez votre code PIN: ")
         if pin not in users:
-            create = input("Ce code PIN n'existe pas. Voulez-vous créer un nouveau compte ? (o/n): ")
+            create = input("Ce code PIN n'existe pas. Créer un compte ? (o/n): ")
             if create.lower() == 'o':
                 try:
-                    nom = input("Entrez votre nom : ")
-                    prenom = input("Entrez votre prénom : ")
-                    email = input("Entrez votre adresse email : ")
-                    solde = float(input("Entrez le solde initial : "))
+                    nom = input("Nom : ")
+                    prenom = input("Prénom : ")
+                    email = input("Email : ")
+                    solde = float(input("Solde initial : "))
                     if solde < 0:
                         print("Solde invalide.")
                         continue
                     new_pin = generer_pin(users)
                     users[new_pin] = {"solde": solde, "nom": nom, "prenom": prenom, "email": email}
-                    print(f"Compte créé avec succès ! Votre code PIN est : {new_pin}")
+                    sauvegarder_donnees(users)
+                    print(f"Succès ! Votre code PIN est : {new_pin}")
                 except ValueError:
                     print("Entrée invalide.")
                 continue
@@ -44,71 +61,65 @@ def atm():
                 print("Accès refusé.")
                 continue
 
-        balance = users[pin]["solde"]
+        # Session utilisateur
         while True:
-            print(f"\nBienvenue {users[pin]['prenom']} {users[pin]['nom']} !")
-            print(f"Votre solde actuel est : ${balance}")
-            print("ATM Menu:")
-            print("1. Dépôt")
-            print("2. Retrait")
-            print("3. Modifier le prénom")
-            print("4. Modifier le nom")
-            print("5. Modifier l'email")
-            print("6. Quitter")
-            choice = input("Votre choix (1-6): ")
+            # On récupère le solde à jour depuis le dictionnaire
+            balance = users[pin]["solde"]
+            print(f"\nBonjour {users[pin]['prenom']} {users[pin]['nom']} | Solde : ${balance}")
+            print("1. Dépôt | 2. Retrait | 3. Modif Prénom | 4. Modif Nom | 5. Modif Email | 6. Quitter")
+            
+            choice = input("Votre choix : ")
+            
             if choice == '1':
                 try:
                     amount = float(input("Montant à déposer : "))
                     if amount > 0:
-                        balance += amount
-                        print(f"${amount} déposé. Nouveau solde : ${balance}")
-                        envoyer_message(users[pin]['email'], "Dépôt effectué", f"Vous avez déposé ${amount}. Nouveau solde : ${balance}")
-                    else:
-                        print("Montant invalide.")
-                except ValueError:
-                    print("Entrée invalide.")
-            elif choice == '2':  # Retrait
+                        users[pin]["solde"] += amount
+                        sauvegarder_donnees(users)
+                        print("Dépôt réussi.")
+                        envoyer_message(users[pin]['email'], "Dépôt", f"Nouveau solde: ${users[pin]['solde']}")
+                    else: print("Montant invalide.")
+                except ValueError: print("Entrée invalide.")
+
+            elif choice == '2':
                 try:
                     amount = float(input("Montant à retirer : "))
-                    if 0 < amount <= balance:
-                        balance -= amount
-                        print(f"${amount} retiré. Nouveau solde : ${balance}")
-                        envoyer_message(users[pin]['email'], "Retrait effectué", f"Vous avez retiré ${amount}. Nouveau solde : ${balance}")
-                    else:
-                        print("Fonds insuffisants ou montant invalide.")
-                except ValueError:
-                    print("Entrée invalide.")
-            elif choice == '3':  # Modifier le prénom
-                new_prenom = input("Entrez le nouveau prénom : ")
-                print("Modification du prénom en cours, veuillez patienter 10 secondes...")
-                time.sleep(10)
-                users[pin]['prenom'] = new_prenom
-                print("Prénom modifié avec succès !")
-                envoyer_message(users[pin]['email'], "Prénom modifié", f"Votre prénom a été changé en {new_prenom}.")
+                    if 0 < amount <= users[pin]["solde"]:
+                        users[pin]["solde"] -= amount
+                        sauvegarder_donnees(users)
+                        print("Retrait réussi.")
+                        envoyer_message(users[pin]['email'], "Retrait", f"Nouveau solde: ${users[pin]['solde']}")
+                    else: print("Fonds insuffisants.")
+                except ValueError: print("Entrée invalide.")
+
+            elif choice == '3':
+                users[pin]['prenom'] = input("Nouveau prénom : ")
+                sauvegarder_donnees(users)
+                print("Modifié !")
+            
             elif choice == '4':  # Modifier le nom
                 new_nom = input("Entrez le nouveau nom : ")
                 print("Modification du nom en cours, veuillez patienter 10 secondes...")
                 time.sleep(10)
                 users[pin]['nom'] = new_nom
                 print("Nom modifié avec succès !")
+                sauvegarder_donnees(users)
                 envoyer_message(users[pin]['email'], "Nom modifié", f"Votre nom a été changé en {new_nom}.")
             elif choice == '5':  # Modifier l'email
                 new_email = input("Entrez la nouvelle adresse email : ")
                 users[pin]['email'] = new_email
                 print("Email modifié avec succès !")
+                sauvegarder_donnees(users)
                 envoyer_message(new_email, "Email modifié", f"Votre adresse email a été changée en {new_email}.")
-            elif choice == '6':
-                print("Merci d'avoir utilisé le distributeur. Au revoir !")
-                users[pin]["solde"] = balance
-                break
-            else:
-                print("Choix invalide. Veuillez réessayer.")
 
-        print("\nComptes existants :")
-        for k, v in users.items():
-            print(f"Nom: {v['prenom']} {v['nom']} | Email: {v['email']} | Solde: $****")
-        print("\nNouvelle session...\n")
-        time.sleep(15)
+            elif choice == '6':
+                print("Déconnexion...")
+                break
+            
+            # (Ajoute les options 4 et 5 sur le même modèle que la 3)
+
+        print("\n--- Session terminée ---")
+        time.sleep(2)
 
 if __name__ == "__main__":
     atm()
