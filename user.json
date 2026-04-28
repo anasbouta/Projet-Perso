@@ -1,0 +1,6 @@
+
+{
+     "1981": {"solde": 1000000000, "nom": "Dupont", "prenom": "Jean", "email": "jean.dupont@email.com"},
+     "6789": {"solde": 500000000, "nom": "Martin", "prenom": "Alice", "email": "alice.martin@email.com"},
+     "5432": {"solde": 20000, "nom": "Doe", "prenom": "John", "email": "john.doe@email.com"}
+}
