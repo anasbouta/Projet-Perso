@@ -1,0 +1,371 @@
+# Copyright © 2026 Anas Boutaghroucht
+# Licensed under the MIT License.
+# See LICENSE file in the project root for full license information.
+
+# ─── Installation requise ───────────────────────────────────
+# pip install bcrypt
+# ────────────────────────────────────────────────────────────
+
+import time
+import secrets
+import sqlite3
+import bcrypt   # pip install bcrypt
+
+DB_FILE       = "atm.db"
+MAX_TENTATIVES   = 3
+BLOCAGE_SECONDES = 30
+
+# ─── COMPTEUR GLOBAL anti-scan (faille n°1) ─────────────────
+# Stocke les tentatives PAR SESSION (adresse mémoire du process)
+# même pour les PIN qui n'existent pas en base
+_tentatives_globales: dict[str, int]  = {}   # ip/session → nb essais
+_bloque_global: dict[str, float]      = {}   # ip/session → timestamp déblocage
+
+SESSION_ID = secrets.token_hex(4)   # identifiant unique de la session courante
+
+
+# ═══════════════════════════════════════════════════════════
+# 🗄️  BASE DE DONNÉES
+# ═══════════════════════════════════════════════════════════
+
+def connexion() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")   # évite la corruption si crash
+    return conn
+
+
+def initialiser_db() -> None:
+    with connexion() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                pin_hash      TEXT UNIQUE NOT NULL,
+                nom           TEXT NOT NULL,
+                prenom        TEXT NOT NULL,
+                email         TEXT NOT NULL,
+                solde         REAL NOT NULL DEFAULT 0,
+                tentatives    INTEGER NOT NULL DEFAULT 0,
+                bloque_jusqu  REAL NOT NULL DEFAULT 0
+            )
+        """)
+        # ── Table historique transactions (bonus) ──────────
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                type       TEXT NOT NULL,
+                montant    REAL NOT NULL,
+                solde_apres REAL NOT NULL,
+                date       REAL NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+            # Mot de passe demo hashé avec bcrypt + sel automatique
+            pin_hash = bcrypt.hashpw(b"1981", bcrypt.gensalt())
+            conn.execute("""
+                INSERT INTO users (pin_hash, nom, prenom, email, solde)
+                VALUES (?, 'Dupont', 'Jean', 'jean.dupont@email.com', 1000000)
+            """, (pin_hash,))
+        conn.commit()
+
+
+# ── Lecture ────────────────────────────────────────────────
+
+def trouver_user_par_pin(pin: str) -> sqlite3.Row | None:
+    """
+    Cherche l'utilisateur en testant le PIN contre TOUS les hash bcrypt.
+    Bcrypt intègre le sel, donc on ne peut pas faire un simple WHERE.
+    On itère sur tous les users — acceptable pour un petit projet.
+    """
+    pin_bytes = pin.encode()
+    with connexion() as conn:
+        for row in conn.execute("SELECT * FROM users"):
+            if bcrypt.checkpw(pin_bytes, row["pin_hash"]):
+                return row
+    return None
+
+
+def pin_existe(pin: str) -> bool:
+    return trouver_user_par_pin(pin) is not None
+
+
+# ── Écriture ───────────────────────────────────────────────
+
+def creer_user(pin: str, nom: str, prenom: str, email: str, solde: float) -> None:
+    # bcrypt.gensalt() génère un sel unique automatiquement → faille n°2 corrigée
+    pin_hash = bcrypt.hashpw(pin.encode(), bcrypt.gensalt())
+    with connexion() as conn:
+        conn.execute("""
+            INSERT INTO users (pin_hash, nom, prenom, email, solde)
+            VALUES (?, ?, ?, ?, ?)
+        """, (pin_hash, nom, prenom, email, solde))
+        conn.commit()
+
+
+def deposer(user_id: int, montant: float) -> float:
+    """
+    Faille n°5 corrigée : calcul fait DIRECTEMENT en SQL, pas en Python.
+    Retourne le nouveau solde.
+    """
+    with connexion() as conn:
+        conn.execute(
+            "UPDATE users SET solde = ROUND(solde + ?, 2) WHERE id = ?",
+            (montant, user_id)
+        )
+        nouveau_solde = conn.execute(
+            "SELECT solde FROM users WHERE id = ?", (user_id,)
+        ).fetchone()[0]
+        conn.execute("""
+            INSERT INTO transactions (user_id, type, montant, solde_apres, date)
+            VALUES (?, 'depot', ?, ?, ?)
+        """, (user_id, montant, nouveau_solde, time.time()))
+        conn.commit()
+        return nouveau_solde
+
+
+def retirer(user_id: int, montant: float) -> float | None:
+    """
+    Faille n°5 corrigée : vérification ET soustraction en SQL atomique.
+    Retourne le nouveau solde, ou None si fonds insuffisants.
+    """
+    with connexion() as conn:
+        solde_actuel = conn.execute(
+            "SELECT solde FROM users WHERE id = ?", (user_id,)
+        ).fetchone()[0]
+        if montant > solde_actuel:
+            return None
+        conn.execute(
+            "UPDATE users SET solde = ROUND(solde - ?, 2) WHERE id = ? AND solde >= ?",
+            (montant, user_id, montant)   # double vérif dans le WHERE
+        )
+        nouveau_solde = conn.execute(
+            "SELECT solde FROM users WHERE id = ?", (user_id,)
+        ).fetchone()[0]
+        conn.execute("""
+            INSERT INTO transactions (user_id, type, montant, solde_apres, date)
+            VALUES (?, 'retrait', ?, ?, ?)
+        """, (user_id, montant, nouveau_solde, time.time()))
+        conn.commit()
+        return nouveau_solde
+
+
+def modifier_champ(user_id: int, champ: str, valeur) -> None:
+    champs_autorises = {"nom", "prenom", "email"}   # solde retiré → passe par deposer/retirer
+    if champ not in champs_autorises:
+        raise ValueError(f"Champ interdit : {champ}")
+    with connexion() as conn:
+        conn.execute(f"UPDATE users SET {champ} = ? WHERE id = ?", (valeur, user_id))
+        conn.commit()
+
+
+def reinitialiser_tentatives(user_id: int) -> None:
+    with connexion() as conn:
+        conn.execute(
+            "UPDATE users SET tentatives = 0, bloque_jusqu = 0 WHERE id = ?", (user_id,)
+        )
+        conn.commit()
+
+
+def incrementer_tentatives_db(user_id: int) -> None:
+    with connexion() as conn:
+        conn.execute(
+            "UPDATE users SET tentatives = tentatives + 1 WHERE id = ?", (user_id,)
+        )
+        tentatives = conn.execute(
+            "SELECT tentatives FROM users WHERE id = ?", (user_id,)
+        ).fetchone()[0]
+        if tentatives >= MAX_TENTATIVES:
+            conn.execute(
+                "UPDATE users SET bloque_jusqu = ? WHERE id = ?",
+                (time.time() + BLOCAGE_SECONDES, user_id)
+            )
+        conn.commit()
+
+
+# ═══════════════════════════════════════════════════════════
+# 🔒  ANTI BRUTE-FORCE GLOBAL (faille n°1)
+# ═══════════════════════════════════════════════════════════
+
+def verifier_blocage_global() -> bool:
+    """Retourne True si la SESSION est bloquée (trop de PIN inconnus testés)."""
+    bloque_jusqu = _bloque_global.get(SESSION_ID, 0)
+    if time.time() < bloque_jusqu:
+        restant = int(bloque_jusqu - time.time())
+        print(f"⛔ Trop de tentatives. Réessayez dans {restant} secondes.")
+        return True
+    return False
+
+
+def incrementer_tentatives_global() -> None:
+    """Incrémente le compteur global même si le PIN n'existe pas en base."""
+    _tentatives_globales[SESSION_ID] = _tentatives_globales.get(SESSION_ID, 0) + 1
+    if _tentatives_globales[SESSION_ID] >= MAX_TENTATIVES:
+        _bloque_global[SESSION_ID] = time.time() + BLOCAGE_SECONDES
+        _tentatives_globales[SESSION_ID] = 0
+        print(f"⛔ Compte bloqué {BLOCAGE_SECONDES} secondes.")
+
+
+def reinitialiser_tentatives_global() -> None:
+    _tentatives_globales[SESSION_ID] = 0
+    _bloque_global[SESSION_ID] = 0
+
+
+# ═══════════════════════════════════════════════════════════
+# ✅  VALIDATION
+# ═══════════════════════════════════════════════════════════
+
+def valider_pin_format(pin: str) -> bool:
+    return pin.isdigit() and len(pin) == 4
+
+
+def valider_montant(prompt: str) -> float | None:
+    try:
+        montant = float(input(prompt))
+        if montant <= 0:
+            print("❌ Le montant doit être positif.")
+            return None
+        return round(montant, 2)
+    except ValueError:
+        print("❌ Entrée invalide.")
+        return None
+
+
+def generer_pin() -> str:
+    while True:
+        pin = str(secrets.randbelow(9000) + 1000)
+        if not pin_existe(pin):
+            return pin
+
+
+# ═══════════════════════════════════════════════════════════
+# 📨  NOTIFICATIONS
+# ═══════════════════════════════════════════════════════════
+
+def envoyer_message(email: str, sujet: str, message: str) -> None:
+    with open("messages.txt", "a", encoding="utf-8") as f:
+        f.write(f"Pour: {email}\nSujet: {sujet}\nMessage: {message}\n---\n")
+
+
+# ═══════════════════════════════════════════════════════════
+# 🏧  ATM PRINCIPAL
+# ═══════════════════════════════════════════════════════════
+
+def atm():
+    initialiser_db()
+
+    while True:
+        # ── Faille n°1 : blocage global avant même de lire le PIN ──
+        if verifier_blocage_global():
+            time.sleep(2)
+            continue
+
+        pin_saisi = input("\nEntrez votre code PIN (4 chiffres) : ").strip()
+
+        if not valider_pin_format(pin_saisi):
+            print("❌ PIN invalide : 4 chiffres requis.")
+            incrementer_tentatives_global()   # ← compte quand même
+            continue
+
+        # Recherche de l'utilisateur (bcrypt compare le PIN à tous les hashs)
+        print("⏳ Vérification...")
+        user = trouver_user_par_pin(pin_saisi)
+
+        # ── PIN inconnu ────────────────────────────────────
+        if user is None:
+            incrementer_tentatives_global()   # ← faille n°1 corrigée
+            # Message identique qu'en cas de mauvais PIN → pas de timing attack
+            print("❌ PIN incorrect.")
+            # On ne propose PAS de créer un compte ici pour éviter
+            # qu'un attaquant sache si le PIN existe ou non
+            # La création se fait via un menu séparé :
+            choix = input("Nouveau client ? (o/n) : ").strip().lower()
+            if choix == 'o':
+                try:
+                    nom    = input("Nom : ").strip()
+                    prenom = input("Prénom : ").strip()
+                    email  = input("Email : ").strip()
+                    solde  = valider_montant("Solde initial : ")
+                    if solde is None:
+                        continue
+                    new_pin = generer_pin()
+                    creer_user(new_pin, nom, prenom, email, solde)
+                    # ── Faille n°4 : on NE affiche PAS le PIN dans la console ──
+                    print("✅ Compte créé !")
+                    print(f"   Votre PIN → [ {new_pin} ] ← Notez-le maintenant, il ne sera plus affiché.")
+                    input("   Appuyez sur Entrée une fois noté...")
+                    # Efface le terminal pour que le PIN ne reste pas visible
+                    print("\033[H\033[J", end="")
+                except Exception as e:
+                    print(f"❌ Erreur : {e}")
+            continue
+
+        # ── Vérification blocage EN BASE ───────────────────
+        if time.time() < user["bloque_jusqu"]:
+            restant = int(user["bloque_jusqu"] - time.time())
+            print(f"⛔ Compte bloqué. Réessayez dans {restant} secondes.")
+            continue
+
+        # PIN correct → réinitialisations
+        reinitialiser_tentatives(user["id"])
+        reinitialiser_tentatives_global()
+        user_id = user["id"]
+
+        # ── Session utilisateur ────────────────────────────
+        while True:
+            user = connexion().execute(
+                "SELECT * FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+
+            print(f"\n👤 Bonjour {user['prenom']} {user['nom']} | 💰 Solde : {user['solde']:.2f} $")
+            print("1. Dépôt  2. Retrait  3. Modif Prénom  4. Modif Nom  5. Modif Email  6. Quitter")
+
+            choix = input("Votre choix : ").strip()
+
+            if choix == '1':
+                montant = valider_montant("Montant à déposer : ")
+                if montant:
+                    nouveau_solde = deposer(user_id, montant)   # SQL atomique
+                    print(f"✅ Dépôt réussi. Nouveau solde : {nouveau_solde:.2f} $")
+                    envoyer_message(user["email"], "Dépôt", f"Dépôt de {montant} $. Solde : {nouveau_solde:.2f} $")
+
+            elif choix == '2':
+                montant = valider_montant("Montant à retirer : ")
+                if montant:
+                    nouveau_solde = retirer(user_id, montant)   # SQL atomique
+                    if nouveau_solde is None:
+                        print("❌ Fonds insuffisants.")
+                    else:
+                        print(f"✅ Retrait réussi. Nouveau solde : {nouveau_solde:.2f} $")
+                        envoyer_message(user["email"], "Retrait", f"Retrait de {montant} $. Solde : {nouveau_solde:.2f} $")
+
+            elif choix == '3':
+                nouveau = input("Nouveau prénom : ").strip()
+                modifier_champ(user_id, "prenom", nouveau)
+                print("✅ Prénom modifié !")
+
+            elif choix == '4':
+                nouveau = input("Nouveau nom : ").strip()
+                modifier_champ(user_id, "nom", nouveau)
+                print("✅ Nom modifié !")
+                envoyer_message(user["email"], "Nom modifié", f"Nouveau nom : {nouveau}")
+
+            elif choix == '5':
+                nouveau_email = input("Nouvel email : ").strip()
+                envoyer_message(user["email"], "Email modifié", f"Nouvel email : {nouveau_email}")
+                modifier_champ(user_id, "email", nouveau_email)
+                print("✅ Email modifié !")
+
+            elif choix == '6':
+                print("👋 Déconnexion...")
+                break
+            else:
+                print("❌ Option invalide.")
+
+        print("\n--- Session terminée ---")
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    atm()
