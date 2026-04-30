@@ -9,7 +9,7 @@ import bcrypt
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 
-# ─── Configuration ──────────────────────────────────────────
+
 DB_FILE = "atm.db"
 MAX_TENTATIVES = 3
 BLOCAGE_SECONDES = 30
@@ -18,9 +18,6 @@ _tentatives_globales = {}
 _bloque_global = {}
 SESSION_ID = secrets.token_hex(4)
 
-# ═══════════════════════════════════════════════════════════
-# 🗄️  LOGIQUE BASE DE DONNÉES & SÉCURITÉ
-# ═══════════════════════════════════════════════════════════
 
 def connexion():
     conn = sqlite3.connect(DB_FILE)
@@ -54,7 +51,7 @@ def initialiser_db():
             )
         """)
         
-        # Vérification/Création d'un compte de test
+     
         nb_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if nb_users == 0:
             print("--- Création du compte de test (PIN: 1234) ---")
@@ -78,7 +75,6 @@ def trouver_user_par_pin(pin):
         print(f"Erreur recherche utilisateur: {e}")
     return None
 
-# ─── OPÉRATIONS FINANCIÈRES ──────────────────────────────────
 
 def deposer(user_id, montant):
     with connexion() as conn:
@@ -121,7 +117,6 @@ def transferer(expediteur_id, email_dest, montant):
             conn.rollback()
             return f"Erreur SQL : {e}"
 
-# ─── SÉCURITÉ ANTI-BRUTEFORCE ───────────────────────────────
 
 def verifier_blocage_global():
     bloque_jusqu = _bloque_global.get(SESSION_ID, 0)
@@ -141,9 +136,6 @@ def reinitialiser_tentatives_global():
     _tentatives_globales[SESSION_ID] = 0
     _bloque_global[SESSION_ID] = 0
 
-# ═══════════════════════════════════════════════════════════
-# 🖥️  INTERFACE TKINTER
-# ═══════════════════════════════════════════════════════════
 
 class ATM_GUI:
     def __init__(self, root):
